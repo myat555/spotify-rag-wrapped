@@ -1,0 +1,136 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: wrapped
+      POSTGRES_PASSWORD: wrapped
+      POSTGRES_DB: wrapped
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wrapped"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # --- Qdrant runs as a real 3-node cluster (Raft consensus, sharded + replicated
+  # collection) rather than a single instance, so the "distributed vector store"
+  # part of the project is genuine, not simulated. ---
+  qdrant-node1:
+    image: qdrant/qdrant:v1.11.0
+    command: ./qdrant --uri http://qdrant-node1:6335
+    environment:
+      QDRANT__CLUSTER__ENABLED: "true"
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data1:/qdrant/storage
+
+  qdrant-node2:
+    image: qdrant/qdrant:v1.11.0
+    command: ./qdrant --bootstrap http://qdrant-node1:6335 --uri http://qdrant-node2:6335
+    environment:
+      QDRANT__CLUSTER__ENABLED: "true"
+    volumes:
+      - qdrant_data2:/qdrant/storage
+    depends_on:
+      - qdrant-node1
+
+  qdrant-node3:
+    image: qdrant/qdrant:v1.11.0
+    command: ./qdrant --bootstrap http://qdrant-node1:6335 --uri http://qdrant-node3:6335
+    environment:
+      QDRANT__CLUSTER__ENABLED: "true"
+    volumes:
+      - qdrant_data3:/qdrant/storage
+    depends_on:
+      - qdrant-node1
+
+  backend:
+    build: ./backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://wrapped:wrapped@postgres:5432/wrapped
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant-node1:6333
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/app:/app/app
+      - ./data:/data
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant-node1:
+        condition: service_started
+
+  worker:
+    build: ./backend
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://wrapped:wrapped@postgres:5432/wrapped
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant-node1:6333
+    volumes:
+      - ./backend/app:/app/app
+      - ./data:/data
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant-node1:
+        condition: service_started
+    deploy:
+      replicas: 3
+
+  flower:
+    build: ./backend
+    command: celery -A app.workers.celery_app flower --port=5555
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+      - worker
+
+  frontend:
+    build: ./frontend
+    command: npm run dev
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  qdrant_data1:
+  qdrant_data2:
+  qdrant_data3:
+  hf_cache:
